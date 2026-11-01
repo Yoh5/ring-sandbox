@@ -347,7 +347,9 @@ class WebhookTarget:
 class Chaos:
     """Fault-injection profile: probabilities applied to webhook delivery and
     flaky endpoints. ``seed`` makes the fault stream deterministic so chaos
-    runs are reproducible in tests."""
+    runs are reproducible in tests: for a given number of deliveries it fixes
+    *how many* faults a run injects, not *which* delivery gets which (see
+    ``rng`` for why, and the README for what a batch run can rely on)."""
 
     seed: int = 0
     duplicate: float = 0.0
@@ -359,10 +361,22 @@ class Chaos:
     rate_limit: float = 0.0
     unavailable: float = 0.0
 
-    def rng(self):
+    def rng(self, stream: str = ""):
+        """A fault stream from ``seed``. Pass ``stream`` for an independent one.
+
+        The emulator's fault consumers run concurrently — a webhook delivery is
+        a task, and the throttle middleware draws on any ``/v1/*`` request — so
+        a single shared stream lets one consumer's draws land between another's
+        and the counts move with the event loop rather than with the seed.
+        One stream per consumer is what makes the seed's promise true for a run
+        instead of only for a serial one. Derived from ``seed`` alone, so the
+        split costs nothing: the same seed still gives the same streams.
+        """
         import random
 
-        return random.Random(self.seed)
+        # `random.Random` hashes a str seed with sha512, so a named stream is
+        # stable across processes — unlike `hash()`, which is salted per run.
+        return random.Random(f"{self.seed}:{stream}" if stream else self.seed)
 
 
 CHAOS_PRESETS: dict[str, Chaos] = {

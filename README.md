@@ -162,9 +162,12 @@ Two things to know when a batch run counts faults:
   `delivery` preset), so a fixed wait is a guess about someone else's machine, and on a
   loaded one the run ends while deliveries are still out and reports fewer than were made.
 
-`--chaos-seed N` fixes *how many* faults a run injects, for a given number of deliveries.
-It does not fix *which* delivery gets which: `meta.request_id` is a fresh uuid4, so a
-delivery has no identity that survives a restart, and deliveries run concurrently.
+`--chaos-seed N` fixes *how many* faults a run injects, for a given number of deliveries,
+and holds whether or not the run also serves `/v1/*` traffic — webhook delivery and the
+data plane draw from separate streams of the same seed, so a busy run and a quiet one
+report the same counts. It does not fix *which* delivery gets which: `meta.request_id` is
+a fresh uuid4, so a delivery has no identity that survives a restart, and deliveries run
+concurrently.
 
 ## pytest
 
