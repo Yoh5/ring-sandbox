@@ -9,7 +9,7 @@ import struct
 import uuid
 import zlib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -61,18 +61,31 @@ class HistoryRecord:
     start: int
     end: int
     reviewed: bool = False
+    riid: str | None = None
+    cv_detections: list[dict[str, Any]] = field(default_factory=list)
 
     def to_jsonapi(self, device_id: str) -> dict[str, Any]:
+        # Real entries carry cv_detections + meta.riid — mirror the shape so
+        # clients can rely on the keys existing. `sub_type` is omitted by the
+        # real API when absent, not nulled.
+        # Recorded shape: attributes are exactly start/end/event_type/
+        # is_third_party_reviewed — the API withholds sub_type from history
+        # entirely (it's a filter-only field; clients must reconstruct it).
+        attrs: dict[str, Any] = {
+            "event_type": self.event_type,
+            "is_third_party_reviewed": self.reviewed,
+            "start": self.start,
+            "end": self.end,
+        }
         return {
             "type": "history-events",
             "id": self.id,
-            "attributes": {
-                "event_type": self.event_type,
-                "is_third_party_reviewed": self.reviewed,
-                "start": self.start,
-                "end": self.end,
+            "attributes": attrs,
+            "relationships": {
+                "source": {"data": {"type": "devices", "id": device_id}},
+                "cv_detections": {"data": self.cv_detections},
             },
-            "relationships": {"source": {"data": {"type": "devices", "id": device_id}}},
+            "meta": {"riid": self.riid},
         }
 
     def matches(self, filters: list[str]) -> bool:
@@ -103,6 +116,10 @@ class SandboxDevice:
     humidity_pct: float | None = None
     history: list[HistoryRecord] = field(default_factory=list)
     reported_at: int = field(default_factory=now_ms)
+    # Recorded JSON:API resources loaded from `record` fixtures — served
+    # verbatim (mutable fields overlaid) so a recorded world reproduces the
+    # real API's exact payload shape, enums and null keys included.
+    recorded: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # ------------------------------------------------------------- JSON:API views
 
@@ -111,11 +128,14 @@ class SandboxDevice:
         return self.kind in CAMERA_KINDS
 
     def to_resource(self) -> dict[str, Any]:
+        recorded_dev = self.recorded.get("device") or {}
+        recorded_rels = recorded_dev.get("relationships") or {}
         rel = {
             name: {
                 "data": {
                     "type": rtype,
-                    "id": f"{self.id}.{name}" if rtype != "locations" else self.location_id,
+                    "id": (recorded_rels.get(name) or {}).get("data", {}).get("id")
+                    or (f"{self.id}.{name}" if rtype != "locations" else self.location_id),
                 },
                 "links": {"related": f"/v1/devices/{self.id}/{name}"},
             }
@@ -126,19 +146,30 @@ class SandboxDevice:
                 ("location", "locations"),
             )
         }
+        attrs = dict(recorded_dev.get("attributes") or {})
+        # mutable bit the emulator owns; everything else verbatim from the
+        # recorded resource so a replayed world reproduces the real shapes
+        attrs["name"] = self.name
+        if not recorded_dev:
+            attrs["image_url"] = f"https://sandbox.invalid/images/{self.kind}.png"
         return {
             "type": "devices",
             "id": self.id,
-            "attributes": {
-                "name": self.name,
-                "image_url": f"https://sandbox.invalid/images/{self.kind}.png",
-            },
+            "attributes": attrs,
             "relationships": rel,
         }
 
     def status_resource(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {"online": self.online}
-        if self.kind in SENSOR_KINDS or self.kind == DeviceKind.CHIME or self.battery is not None:
+        recorded_attrs = dict(self.recorded.get("status", {}).get("attributes", {}))
+        # A recorded world serves the real payload verbatim except the mutable
+        # bits the emulator genuinely owns (online state, last-report time).
+        attrs: dict[str, Any] = recorded_attrs or {"online": self.online}
+        if recorded_attrs:
+            attrs["online"] = self.online
+            attrs["reported_at"] = datetime.fromtimestamp(
+                self.reported_at / 1000, tz=UTC
+            ).isoformat()
+        elif self.kind in SENSOR_KINDS or self.kind == DeviceKind.CHIME or self.battery is not None:
             attrs["reported_at"] = datetime.fromtimestamp(
                 self.reported_at / 1000, tz=UTC
             ).isoformat()
@@ -146,6 +177,14 @@ class SandboxDevice:
             attrs["battery_status"] = {
                 "percentage": self.battery if self.battery is not None else 255
             }
+        if self.is_camera:
+            attrs.setdefault("audio", {"snooze": {"active": None, "until": None}})
+            attrs.setdefault("state", None)
+            # Cameras always report a last-seen timestamp on the real API.
+            attrs.setdefault(
+                "reported_at",
+                datetime.fromtimestamp(self.reported_at / 1000, tz=UTC).isoformat(),
+            )
         if self.kind == DeviceKind.CONTACT_SENSOR:
             attrs["contact_detection"] = {"faulted": self.faulted}
             attrs["tamper_detection"] = {"detected": self.tamper}
@@ -159,9 +198,12 @@ class SandboxDevice:
             attrs["humidity"] = {"value": self.humidity_pct, "unit": "percent"}
         if self.kind == DeviceKind.CHIME:
             attrs["audio"] = {"snooze": {"active": False, "until": None}}
-        return {"type": "device-status", "id": f"{self.id}.status", "attributes": attrs}
+        rid = self.recorded.get("status", {}).get("id", f"{self.id}.status")
+        return {"type": "device-status", "id": rid, "attributes": attrs}
 
     def capabilities_resource(self, component_id: str | None = None) -> dict[str, Any]:
+        if "capabilities" in self.recorded:
+            return self.recorded["capabilities"]
         null_video = {
             "configurations": None,
             "codecs": None,
@@ -181,7 +223,23 @@ class SandboxDevice:
                 },
                 "motion_detection": {"configurations": ["enabled", "motion_zones"]},
                 "image_enhancements": {
-                    "configurations": ["color_night_vision", "hdr", "privacy_zones"]
+                    "configurations": ["color_night_vision", "hdr", "privacy_zones", "snapshot"]
+                },
+                # The real camera payload carries these keys nulled, not absent —
+                # clients distinguish "unsupported" (null) from "unknown" (missing).
+                **{
+                    k: None
+                    for k in (
+                        "audio",
+                        "flood_detection",
+                        "tamper_detection",
+                        "glass_break_detection",
+                        "smoke_detection",
+                        "freeze_detection",
+                        "co_detection_listener",
+                        "battery_status",
+                        "contact_detection",
+                    )
                 },
             }
             if self.components:
@@ -217,14 +275,21 @@ class SandboxDevice:
         }
 
     def configurations_resource(self) -> dict[str, Any]:
+        if "configurations" in self.recorded:
+            return self.recorded["configurations"]
         if self.is_camera:
+            # real API uses "on"/"off" string enums, and exposes audio volume
+            # plus ir_led_night_vision/auto_zoom_track keys on cameras
             attrs: dict[str, Any] = {
-                "motion_detection": {"enabled": True, "motion_zones": []},
+                "motion_detection": {"enabled": "on", "motion_zones": []},
                 "image_enhancements": {
-                    "color_night_vision": True,
-                    "hdr": False,
+                    "color_night_vision": "off",
+                    "hdr": "off",
+                    "ir_led_night_vision": "off",
+                    "auto_zoom_track": "off",
                     "privacy_zones": [],
                 },
+                "audio": {"customizable_slots": None, "volume": 11},
             }
         elif self.kind == DeviceKind.CHIME:
             attrs = {
@@ -263,6 +328,8 @@ class SandboxDevice:
         }
 
     def location_resource(self) -> dict[str, Any]:
+        if "location" in self.recorded:
+            return self.recorded["location"]
         return {
             "type": "locations",
             "id": self.location_id,
@@ -329,11 +396,43 @@ class World:
         }
     )
     required_token: str | None = None
+    token_scopes: dict[str, set[str]] = field(default_factory=dict)
+    enforce_subscriptions: bool = False
     media_dir: Path | None = None
     delivered: list[dict[str, Any]] = field(default_factory=list)
     app_integration_status: str | None = None
+    # ms epoch at which the user consented (app-integration completed) — the
+    # real API exposes no history/media from before that instant. None = the
+    # consent flow never ran on this world (no boundary enforced).
+    consent_at: int | None = None
+    # authorization_code grant support: minted codes (60 s TTL) → client_id.
+    authz_codes: dict[str, dict[str, Any]] = field(default_factory=dict)
     subscriptions: dict[str, dict[str, Any]] = field(default_factory=dict)
     whep_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # steady-state rate-limit accounting (X-RateLimit-* headers, /v1 only)
+    _rl_window: int = 0
+    _rl_used: int = 0
+
+    # ----------------------------------------------------------- token auth
+
+    def scopes_for(self, token: str) -> set[str] | None:
+        """Scopes recorded for a bearer token — ``None`` means unconstrained
+        (a token not registered carries full access, matching pre-gating
+        behavior for worlds that never touch scope state)."""
+        return self.token_scopes.get(token)
+
+    def device_subscribed(self, device_id: str) -> bool:
+        """True when the device has a subscription/trial that is both in an
+        entitled state and unexpired — what gates event delivery and media."""
+        now = datetime.now(tz=UTC)
+        for sub in self.subscriptions.values():
+            if sub["device_id"] != device_id:
+                continue
+            if sub["state"] not in ("active", "trialing"):
+                continue
+            if datetime.fromisoformat(sub["expires_at"].replace("Z", "+00:00")) > now:
+                return True
+        return False
 
     # ------------------------------------------------------------- devices
 
@@ -383,6 +482,26 @@ class World:
             dev.tamper = True
         elif event_type == WebhookEventType.TAMPER_CLEARED:
             dev.tamper = False
+        elif event_type == WebhookEventType.SUBSCRIPTION_ACTIVATED:
+            # Keep entitlement state truthful with the delivered event: an
+            # activation creates the plan row it announces.
+            if not self.device_subscribed(device_id):
+                now = datetime.now(tz=UTC)
+                self.subscriptions[f"sub_{device_id}.{at_ms}"] = {
+                    "id": f"sub_{device_id}.{at_ms}",
+                    "device_id": device_id,
+                    "plan_id": "sandbox.protect.basic",
+                    "state": "active",
+                    "expires_at": (now + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
+                    "created_at": now.isoformat().replace("+00:00", "Z"),
+                }
+        elif event_type == WebhookEventType.SUBSCRIPTION_DEACTIVATED:
+            # Lapse voids the entitlement it announces — subsequent gated
+            # surfaces (history/media/WHEP/webhook fan-out) reflect it.
+            for sub in self.subscriptions.values():
+                if sub["device_id"] == device_id and sub["state"] in ("active", "trialing"):
+                    sub["state"] = "canceled"
+                    sub["expires_at"] = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
         hist_type = _HISTORY_TYPE.get(event_type)  # type: ignore[call-overload]
         if hist_type is None:
             return None
@@ -394,6 +513,9 @@ class World:
             sub_type=sub_type,
             start=at_ms,
             end=at_ms + duration_ms,
+            # Motion recordings carry a Ring-internal recording id (meta.riid);
+            # on_demand/ding rows stay null like the real API.
+            riid=str(uuid.uuid4()) if hist_type == "motion" else None,
         )
         dev.history.append(rec)
         dev.history.sort(key=lambda r: r.start, reverse=True)
@@ -459,6 +581,90 @@ class World:
 
 
 # --------------------------------------------------------------------------- seeds
+
+
+def _kind_from_recorded(device: dict[str, Any], caps: dict[str, Any] | None) -> DeviceKind:
+    """Best-effort device kind from a recorded JSON:API resource — the Partner
+    API doesn't ship a kind field, so sniff the image path and capabilities."""
+    url = (device.get("attributes") or {}).get("image_url", "").lower()
+    if "doorbell" in url:
+        return DeviceKind.DOORBELL
+    video = ((caps or {}).get("attributes") or {}).get("video") or {}
+    if video.get("configurations"):
+        return DeviceKind.CAMERA
+    if "chime" in url:
+        return DeviceKind.CHIME
+    return DeviceKind.CONTACT_SENSOR
+
+
+def load_fixture_docs(world: World, docs: dict[str, dict[str, Any]]) -> dict[str, int]:
+    """Load `ring-sandbox record` output into a world: ``{filename: parsed
+    json}`` — devices.json, me.json, history.<device_id>.json. Recorded
+    devices keep their real IDs and serve their recorded included resources
+    verbatim, so a recorded world reproduces the real API's exact shapes."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    counts = {"devices": 0, "history": 0}
+    # accept either a {filename: doc} map or a directory path
+    if isinstance(docs, (str, _Path)):
+        root = _Path(docs)
+        docs = {p.name: _json.loads(p.read_text(encoding="utf-8")) for p in root.glob("*.json")}
+    devices_doc = docs.get("devices.json")
+    if devices_doc:
+        included = {r["id"]: r for r in devices_doc.get("included", [])}
+        for res in devices_doc.get("data", []):
+            rels = res.get("relationships", {})
+            recorded = {"device": res}
+            for name in ("status", "capabilities", "configurations", "location"):
+                rid = (rels.get(name) or {}).get("data", {}).get("id")
+                if rid and rid in included:
+                    recorded[name] = included[rid]
+            dev = SandboxDevice(
+                kind=_kind_from_recorded(res, recorded.get("capabilities")),
+                name=(res.get("attributes") or {}).get("name", "Recorded device"),
+                id=res["id"],
+                online=(recorded.get("status", {}).get("attributes") or {}).get("online", True),
+                recorded=recorded,
+            )
+            world.add(dev)
+            counts["devices"] += 1
+    me_doc = docs.get("me.json")
+    if me_doc and me_doc.get("data"):
+        world.user = me_doc["data"].get("attributes", world.user)
+        world.account_id = me_doc["data"].get("id", world.account_id)
+    for name, doc in docs.items():
+        if not name.startswith("history"):
+            continue
+        stem = (
+            name.removeprefix("history")
+            .removeprefix("-on-demand.")
+            .lstrip(".")
+            .removesuffix(".json")
+        )
+        dev = world.get(stem)
+        if dev is None:
+            continue
+        for entry in doc.get("data", []):
+            attrs = entry.get("attributes", {})
+            dev.history.append(
+                HistoryRecord(
+                    id=entry.get("id", f"{dev.id}.{attrs.get('event_type')}.{attrs.get('start')}"),
+                    event_type=attrs.get("event_type", "on_demand"),
+                    sub_type=attrs.get("sub_type"),
+                    start=attrs.get("start", 0),
+                    end=attrs.get("end", 0),
+                    reviewed=attrs.get("is_third_party_reviewed", False),
+                    riid=(entry.get("meta") or {}).get("riid"),
+                    cv_detections=(
+                        (entry.get("relationships") or {}).get("cv_detections") or {}
+                    ).get("data")
+                    or [],
+                )
+            )
+            counts["history"] += 1
+        dev.history.sort(key=lambda r: r.start, reverse=True)
+    return counts
 
 
 def default_world() -> World:

@@ -1,0 +1,45 @@
+# Custom scenario for `ring-sandbox play` / `attest replay`.
+#
+# The aide arrives on time, but the Ring plan lapses 35 minutes in — from that
+# point observation events stop being delivered (an unsubscribed device is
+# not entitled to event fan-out) while the subscription_deactivated lifecycle
+# webhook still posts. Pair with `serve --enforce-subscriptions` and the
+# emulator drops what the real API would: the injected deactivation flips the
+# world's entitlement, later motion steps journal as webhook.suppressed,
+# history/media answer empty/403, and the lapse itself remains visible — the
+# signed coverage story is "billing event", never "device fault".
+# Field reference (see ring_sandbox.scenarios.Step):
+#   offset_s    seconds after the scenario's simulated start
+#   type        webhook event type: motion_detected | button_press |
+#               contact_sensor_faulted | contact_sensor_cleared |
+#               device_offline | device_online |
+#               subscription_activated | subscription_deactivated
+#   sub_type    motion hint: human | vehicle | package (optional)
+#   device      device id or name; omit for the default doorbell (optional)
+#   duration_ms event duration in milliseconds (optional)
+
+name: subscription_lapse
+description: On-time arrival, then the plan lapses mid-visit — observation quietly stops being entitled.
+steps:
+  - offset_s: 0
+    type: motion_detected
+    sub_type: human
+  - offset_s: 6
+    type: button_press
+  - offset_s: 20
+    type: contact_sensor_faulted
+    device: Front Door Sensor
+  - offset_s: 35
+    type: contact_sensor_cleared
+    device: Front Door Sensor
+  - offset_s: 1800   # 30 min in — mid-visit motion the plan still covers
+    type: motion_detected
+    sub_type: human
+  - offset_s: 2100   # the subscription lapses — lifecycle posts, entitlement voids
+    type: subscription_deactivated
+  - offset_s: 2400   # suppressed under --enforce-subscriptions: departure unobserved
+    type: motion_detected
+    sub_type: human
+  - offset_s: 5400   # suppressed — and history keeps nothing for the span
+    type: contact_sensor_faulted
+    device: Front Door Sensor

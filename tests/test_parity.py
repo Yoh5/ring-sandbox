@@ -245,9 +245,11 @@ def test_whep_session_lifecycle():
 
     with RingClient("sandbox-token", base_url=base, transport=httpx.HTTPTransport()) as client:
         session = client.whep_session(cam.id, OFFER)
-        assert session.session_url.startswith(
-            f"/v1/devices/{cam.id}/media/streaming/whep/sessions/"
+        # the real API returns an absolute session URL (client strips the origin)
+        assert session.session_url.endswith(
+            f"/v1/devices/{cam.id}/media/streaming/whep/sessions/{session.session_id}"
         )
+        assert session.session_url.startswith("http")
         assert session.session_id and "a=recvonly" in session.sdp_answer
         assert session.session_id in world.whep_sessions
         # A live view surfaces in Event History as on_demand

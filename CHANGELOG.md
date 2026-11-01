@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Consent boundary** — completing the app-integration sets
+  `World.consent_at`: earlier history rows are filtered out and pre-consent
+  media requests answer `403 TIME_RANGE_NOT_AUTHORIZED` (forum-documented
+  upstream semantics).
+- **`authorization_code` grant** — `POST /_sandbox/authz-codes` mints
+  single-use codes (60 s TTL); `/oauth/token` exchanges them, returns the
+  granted `scope` field, and answers RFC 6749 `{"error", "error_description"}`
+  shapes. The client parses both error dialects.
+- **Steady-state rate limiting** — `X-RateLimit-Limit`/`X-RateLimit-Remaining`
+  on every `/v1/*` response plus a real 100 req/s limiter → 429.
+- **Webhook retries** — failed deliveries retry twice with the same
+  `request_id` (journaled `webhook.retry`); any non-2xx counts as failure.
+- **WHEP fidelity** — SDP answers carry `ice-ufrag`/`ice-pwd`/`fingerprint`/
+  `mid`/`setup` lines a real `RTCPeerConnection` accepts; `Location` is
+  absolute; `ETag` + `Link: rel="ice-server"` headers; 30 s battery / 60 s
+  wired session TTL — closing an expired session 404s.
+- **Offline-device refusals** — media and WHEP routes 503 `device_offline`
+  when the device is down.
+- JSON:API `errors[]` envelope for request-validation failures; camera
+  capability null-keys + `reported_at` parity; `component_id` accepted on
+  configurations; `meta.riid` on generated motion records.
+
+### Changed
+
+- `latest_in_range` image requests now 416 when no recording covers the
+  window — previously they silently returned a frame at the window end.
+- History `links.next` only while a further page exists (final page omits
+  `links` entirely, empty history is bare `{"data": []}`), and `next` drops
+  `event_types` — the documented silent-widening trap. `sub_type` is
+  withheld from history resources (filter-only upstream).
+- Webhook `request_id` reuse across retries makes receivers' idempotency
+  load-bearing — matching upstream's documented retry semantics.
+
+### Fixed
+
+- Image downloads logged the `on_demand` history row twice.
+- Video downloads accepted `duration <= 0`.
+
+## 0.5.0 — 2026-10-04
+
+### Added
+
+- **Record → replay** — `load_fixture_docs(world, docs)` plus
+  `ring-sandbox serve --fixtures DIR` and `POST /_sandbox/load` replay
+  `record` output back through the emulator: real device resources are
+  served with their original ids and compound `included` members
+  (`device-status`/`device-capabilities`/`device-configurations`/`locations`)
+  verbatim, and recorded history replays with `meta.riid`,
+  `cv_detections`, and absent `sub_type` preserved. Capture a real API
+  surface once, replay it deterministically in CI forever.
+- **Token scopes** — `World.token_scopes`, `POST|DELETE
+  /_sandbox/tokens`, and `serve --read-token TOKEN` register an
+  `ava.v1:read`-scoped bearer token: GETs pass, mutations answer
+  `403 insufficient_scope`, and the subscriptions surface answers `422` —
+  the statuses recorded from live `api.amazonvision.com` probing.
+  Unregistered tokens stay unconstrained.
+- **Plan enforcement** — `serve --enforce-subscriptions` (or
+  `World.enforce_subscriptions`) makes entitlement real: no active
+  subscription/trial means empty Event History, `403
+  subscription_required` on media downloads and WHEP sessions, and
+  observation webhooks suppressed (journaled as `webhook.suppressed`).
+  `subscription_*`/`device_*` lifecycle events still deliver — they carry
+  the entitlement signal itself.
+- **Coherent subscription lifecycle** — injected
+  `subscription_activated`/`subscription_deactivated` events now mutate
+  the subscription rows they announce, so gated surfaces answer
+  truthfully after the event; scenarios can script plan lapses that
+  actually lapse.
+
 ## 0.4.1 — 2026-09-30
 
 ### Added

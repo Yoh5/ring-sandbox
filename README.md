@@ -67,6 +67,25 @@ Custom scenarios are plain YAML — `steps` entries take `offset_s`, `type`, opt
 
 Interactive docs at `http://127.0.0.1:8787/_sandbox/docs`. Drop real `default.jpg` / `default.mp4` (or `<device_id>.jpg`) in a folder and pass `--media-dir` to serve real media instead of placeholders.
 
+### Record → replay
+
+Capture a real API surface once, replay it in CI forever:
+
+```bash
+ring-sandbox record --token <playground token> --out fixtures/   # snapshot real responses
+ring-sandbox serve --fixtures fixtures/                          # replay them in the emulator
+```
+
+`--fixtures` loads `devices.json` (+ included `device-status`/`device-capabilities`/
+`device-configurations`/`locations` resources), `me.json`, and
+`history[.-on-demand].<device_id>.json`. Recorded devices keep their real IDs and
+serve the recorded included resources **verbatim** — only genuinely mutable fields
+(`online`, `reported_at`, `name`) are overlaid by the emulator. The same load is
+available at runtime via `POST /_sandbox/load` with either `{"path": "fixtures/"}`
+or a `{filename: parsed_json}` body, so a test suite can replay a recording
+without restarting the server. `fixtures/` in this repo is a real Playground
+capture — `tests/test_fixture_replay.py` pins its parity.
+
 ### Fidelity notes
 
 The emulator reproduces the parts of the API that bite integrators:
@@ -75,18 +94,29 @@ The emulator reproduces the parts of the API that bite integrators:
 |---|---|
 | JSON:API compound documents via `?include=` | yes |
 | History newest-first, `page[key]` cursor, dotted `event_types` filters | yes |
+| History traps: `links.next` only while a further page exists, and it **drops `event_types`** (filtered queries silently widen when paged); empty history is the bare `{"data": []}` — no `links` key; `sub_type` is withheld from history (filter-only field — `event_types=motion.human` still filters) | yes |
+| `meta.riid` on motion recordings, null elsewhere | yes |
 | `is_third_party_reviewed` flips after media access | yes |
 | Snapshot `303 See Other` to a pre-signed URL | yes |
+| `latest_in_range` 416s when nothing was recorded — never a frame from another time | yes |
 | Clip `206 Partial` + `X-Media-Length`, `416 TIMESTAMP_NOT_FOUND` when idle | yes |
+| Consent boundary: completing the app-integration sets the consent instant — earlier history is filtered out and pre-consent media requests 403 `TIME_RANGE_NOT_AUTHORIZED` | yes |
+| Offline devices 503 `device_offline` on media/WHEP | yes |
 | Chime playback restricted to the app's two audio slots | yes |
 | Sensor `faulted` semantics, `255` battery sentinel on mains devices | yes |
 | Webhook v1.1 payloads with `sub_type`, `component_ids`, HMAC `X-Signature` | yes |
 | App-integration lifecycle (`awaiting` → `completed`), `app_integration_*` + `device_added`/`removed` account-linking webhooks | yes |
 | `GET /v1/accounts/me/subscriptions` + `subscription_activated`/`deactivated` webhooks (plan_id, expires_at) | yes |
-| WHEP sessions: SDP offer → 201 + SDP answer + `Location`, `DELETE` to close, live views log `on_demand` history | yes |
+| Token scopes: `--read-token T` marks `T` as `ava.v1:read`-scoped — GETs pass, mutations 403 `insufficient_scope`, the subscriptions surface 422 (all observed live) | yes |
+| Plan gating: `--enforce-subscriptions` makes entitlement real — no retained history, 403 `subscription_required` on media/WHEP, and observation webhooks suppressed (journaled as `webhook.suppressed`) while `subscription_*`/`device_*` lifecycle events still deliver; injected `subscription_*` steps mutate the entitlement they announce | yes, opt-in |
+| WHEP sessions: SDP offer → 201 + parseable SDP answer (ICE/DTLS/mid lines), **absolute** `Location`, `ETag` + `Link: rel="ice-server"`, 30 s battery / 60 s wired TTL (expired close → 404), `DELETE` to close, live views log `on_demand` history | yes |
+| `X-RateLimit-Limit`/`X-RateLimit-Remaining` headers on every `/v1/*` response + a real 100 req/s/token limiter → 429 + `Retry-After` | yes |
 | `429`/`503` + `Retry-After` rate-limit faults (`--chaos rate_limit=…`) | yes |
-| OAuth / nonce verification | no (use any bearer token, or `--token` to pin one) |
-| RTSP live video (`rtsps://`) | no |
+| Failed webhook deliveries retry twice (same `request_id` — receivers must be idempotent); any non-2xx counts as failure | yes |
+| OAuth: `refresh_token` grant plus `authorization_code` (codes minted via `POST /_sandbox/authz-codes`, 60 s TTL, single-use); RFC 6749 error shapes; token body carries `scope`/`expires_in` | yes |
+| JSON:API `errors[]` envelope on validation failures (no FastAPI `{"detail"}` leaks) | yes |
+| Camera capability/status null-keys and `reported_at` parity with recorded payloads | yes |
+| OAuth nonce verification (`nonce` body field), 403-vs-404 unconsented device distinction, RTSP live video (`rtsps://`), HEVC offer rejection | no |
 
 ## Webhooks
 

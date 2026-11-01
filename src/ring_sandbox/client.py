@@ -708,8 +708,19 @@ def _resolution(width: int | None, height: int | None) -> dict[str, int] | None:
 
 def _parse_errors(resp: httpx.Response) -> list[APIError]:
     try:
-        errs = resp.json().get("errors", [])
-        return [APIError.model_validate(e) for e in errs]
+        doc = resp.json()
+        # The token endpoint answers in RFC 6749 shape ({"error", "error_description"});
+        # the data plane uses JSON:API errors[]. Clients must read both.
+        if "errors" in doc:
+            return [APIError.model_validate(e) for e in doc.get("errors") or []]
+        if isinstance(doc.get("error"), str):
+            return [
+                APIError(
+                    code=doc["error"],
+                    detail=doc.get("error_description") or doc["error"],
+                )
+            ]
+        return []
     except Exception:
         return []
 
